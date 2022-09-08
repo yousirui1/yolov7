@@ -1,3 +1,4 @@
+import os
 import math
 from copy import copy
 from pathlib import Path
@@ -192,18 +193,41 @@ class DownC(nn.Module):
         return torch.cat((self.cv2(self.cv1(x)), self.cv3(self.mp(x))), dim=1)
 
 
-class SPP(nn.Module):
-    # Spatial pyramid pooling layer used in YOLOv3-SPP
-    def __init__(self, c1, c2, k=(5, 9, 13)):
-        super(SPP, self).__init__()
-        c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
-        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+if os.getenv('RKNN_model_hack', '0') == '0':
+    class SPP(nn.Module):
+        # Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729
+        def __init__(self, c1, c2, k=(5, 9, 13)):
+            super(SPP, self).__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+            self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
 
-    def forward(self, x):
-        x = self.cv1(x)
-        return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
+        def forward(self, x):
+            x = self.cv1(x)
+            return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
+elif os.getenv('RKNN_model_hack', '0') in ['npu_1', 'npu_2']:
+    # TODO remove this hack when rknn-toolkit1/2 add this optimize rules
+    class SPP(nn.Module):
+        def __init__(self, c1, c2, k=(5, 9, 13)):
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+            self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+            for value in k:
+                assert (value%2 == 1) and (value!= 1), "value in [{}] only support odd number for RKNN model hack"
+
+        def forward(self, x):
+            x = self.cv1(x)
+            y = [x]
+            for maxpool in self.m:
+                kernel_size = maxpool.kernel_size
+                m = x
+                for i in range(math.floor(kernel_size/2)):
+                    m = torch.nn.functional.max_pool2d(m, 3, 1, 1)
+                y = [*y, m]
+            return self.cv2(torch.cat(y, 1))
     
 
 class Bottleneck(nn.Module):
@@ -259,25 +283,59 @@ class Ghost(nn.Module):
 
 ##### cspnet #####
 
-class SPPCSPC(nn.Module):
-    # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
-        super(SPPCSPC, self).__init__()
-        c_ = int(2 * c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(c_, c_, 3, 1)
-        self.cv4 = Conv(c_, c_, 1, 1)
-        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
-        self.cv5 = Conv(4 * c_, c_, 1, 1)
-        self.cv6 = Conv(c_, c_, 3, 1)
-        self.cv7 = Conv(2 * c_, c2, 1, 1)
+if os.getenv('RKNN_model_hack', '0') == '0':
+    class SPPCSPC(nn.Module):
+        # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
+        def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
+            super(SPPCSPC, self).__init__()
+            c_ = int(2 * c2 * e)  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c1, c_, 1, 1)
+            self.cv3 = Conv(c_, c_, 3, 1)
+            self.cv4 = Conv(c_, c_, 1, 1)
+            self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+            self.cv5 = Conv(4 * c_, c_, 1, 1)
+            self.cv6 = Conv(c_, c_, 3, 1)
+            self.cv7 = Conv(2 * c_, c2, 1, 1)
 
-    def forward(self, x):
-        x1 = self.cv4(self.cv3(self.cv1(x)))
-        y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
-        y2 = self.cv2(x)
-        return self.cv7(torch.cat((y1, y2), dim=1))
+        def forward(self, x):
+            x1 = self.cv4(self.cv3(self.cv1(x)))
+            y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
+            y2 = self.cv2(x)
+            return self.cv7(torch.cat((y1, y2), dim=1))
+elif os.getenv('RKNN_model_hack', '0') in ['npu_1', 'npu_2']:
+    # TODO remove this hack when rknn-toolkit1/2 add this optimize rules
+    class SPPCSPC(nn.Module):
+        # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
+        def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
+            super(SPPCSPC, self).__init__()
+            c_ = int(2 * c2 * e)  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c1, c_, 1, 1)
+            self.cv3 = Conv(c_, c_, 3, 1)
+            self.cv4 = Conv(c_, c_, 1, 1)
+            self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+            self.cv5 = Conv(4 * c_, c_, 1, 1)
+            self.cv6 = Conv(c_, c_, 3, 1)
+            self.cv7 = Conv(2 * c_, c2, 1, 1)
+
+        def forward(self, x):
+            x1 = self.cv4(self.cv3(self.cv1(x)))
+            # y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
+            y1 = []
+            last_i = -1
+            for maxpool in self.m:
+                kernel_size = maxpool.kernel_size
+                m = x1 if y1 == [] else y1[-1]
+                for i in range(math.floor(kernel_size/2)):
+                    if i <= last_i:
+                        continue
+                    m = torch.nn.functional.max_pool2d(m, 3, 1, 1)
+                y1 = [*y1, m]
+                last_i = i
+            y1 = self.cv6(self.cv5(torch.cat([x1] + y1, 1)))
+            y2 = self.cv2(x)
+            return self.cv7(torch.cat((y1, y2), dim=1))
 
 class GhostSPPCSPC(SPPCSPC):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
@@ -803,22 +861,46 @@ class Focus(nn.Module):
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
         return self.conv(torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1))
         # return self.conv(self.contract(x))
-        
 
-class SPPF(nn.Module):
-    # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
-    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
-        super().__init__()
-        c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+if os.getenv('RKNN_model_hack', '0') in ['0','npu_2']:
+    class SPPF(nn.Module):
+        # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
+        def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * 4, c2, 1, 1)
+            self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
-    def forward(self, x):
-        x = self.cv1(x)
-        y1 = self.m(x)
-        y2 = self.m(y1)
-        return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+        def forward(self, x):
+            x = self.cv1(x)
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+elif os.getenv('RKNN_model_hack', '0') == 'npu_1':
+    class SPPF(nn.Module):
+        # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
+        def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * 4, c2, 1, 1)
+            self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+        def forward(self, x):
+            x = self.cv1(x)
+            y1 = self.m(x)
+            y2 = self.m(y1)
+
+            y = [x]
+            kernel_size = self.m.kernel_size
+            _3x3_stack = math.floor(kernel_size/2)
+            for i in range(3):
+                m = y[-1]
+                for _ in range(_3x3_stack):
+                    m = torch.nn.functional.max_pool2d(m, 3, 1, 1)
+                y = [*y, m]
+            return self.cv2(torch.cat(y, 1))
     
     
 class Contract(nn.Module):

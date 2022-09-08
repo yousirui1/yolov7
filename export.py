@@ -1,9 +1,20 @@
+import os
 import argparse
 import sys
 import time
 import warnings
 
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
+
+# activate rknn hack
+if len(sys.argv)>=3 and '--rknpu' in sys.argv:
+    _index = sys.argv.index('--rknpu')
+    if sys.argv[_index+1].upper() in ['RK1808', 'RV1109', 'RV1126','RK3399PRO']:
+        os.environ['RKNN_model_hack'] = 'npu_1'
+    elif sys.argv[_index+1].upper() in ['RK3566', 'RK3568', 'RK3588','RK3588S','RV1106','RV1103']:
+        os.environ['RKNN_model_hack'] = 'npu_2'
+    else:
+        assert False,"{} not recognized".format(sys.argv[_index+1])
 
 import torch
 import torch.nn as nn
@@ -18,7 +29,7 @@ from utils.add_nms import RegisterNMS
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='./yolor-csp-c.pt', help='weights path')
+    parser.add_argument('--weights', type=str, default='./yolov7-tiny.pt', help='weights path')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='image size')  # height, width
     parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     parser.add_argument('--dynamic', action='store_true', help='dynamic ONNX axes')
@@ -34,7 +45,9 @@ if __name__ == '__main__':
     parser.add_argument('--include-nms', action='store_true', help='export end2end onnx')
     parser.add_argument('--fp16', action='store_true', help='CoreML FP16 half-precision export')
     parser.add_argument('--int8', action='store_true', help='CoreML INT8 quantization')
+    parser.add_argument('--rknpu', default=None, help='RKNN npu platform')
     opt = parser.parse_args()
+    del opt.rknpu
     opt.img_size *= 2 if len(opt.img_size) == 1 else 1  # expand
     opt.dynamic = opt.dynamic and not opt.end2end
     opt.dynamic = False if opt.dynamic_batch else opt.dynamic
@@ -57,14 +70,34 @@ if __name__ == '__main__':
     # Update model
     for k, m in model.named_modules():
         m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatibility
-        if isinstance(m, models.common.Conv):  # assign export-friendly activations
-            if isinstance(m.act, nn.Hardswish):
-                m.act = Hardswish()
-            elif isinstance(m.act, nn.SiLU):
-                m.act = SiLU()
+        # if isinstance(m, models.common.Conv):  # assign export-friendly activations
+        #     if isinstance(m.act, nn.Hardswish):
+        #         m.act = Hardswish()
+        #     elif isinstance(m.act, nn.SiLU):
+        #         m.act = SiLU()
         # elif isinstance(m, models.yolo.Detect):
         #     m.forward = m.forward_export  # assign forward (optional)
     model.model[-1].export = not opt.grid  # set Detect() layer grid export
+    if os.getenv('RKNN_model_hack', '0') != '0':
+        if os.getenv('RKNN_model_hack', '0') in ['npu_1']:
+            from models.common import SP
+            for k, m in model.named_modules():
+                if isinstance(m, SP) and m.m.kernel_size%2==1 and m.m.stride==1:
+                    new_sp = nn.Sequential(*[nn.MaxPool2d(3,1,1) for i in range(m.m.kernel_size//2)])
+                    m.m = new_sp
+
+        from models.yolo import Detect
+        if isinstance(model.model[-1], Detect):
+            # save anchors
+            print('---> save anchors for RKNN')
+            RK_anchors = model.model[-1].stride.reshape(3,1).repeat(1,3).reshape(-1,1)* model.model[-1].anchors.reshape(9,2)
+            with open('RK_anchors.txt', 'w') as anf:
+                # anf.write(str(model.model[-1].na)+'\n')
+                for _v in RK_anchors.numpy().flatten():
+                    anf.write(str(_v)+'\n')
+            RK_anchors = RK_anchors.tolist()
+            print(RK_anchors)
+
     y = model(img)  # dry run
     if opt.include_nms:
         model.model[-1].include_nms = True
